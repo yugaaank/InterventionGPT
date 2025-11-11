@@ -1,35 +1,57 @@
 import streamlit as st
-import ollama
 import chromadb
 import os
-from typing import List
 import time
+from typing import List
+from sentence_transformers import SentenceTransformer
+from huggingface_hub import InferenceClient
+from dotenv import load_dotenv  # <-- added
 
-# --- Configuration ---
+# =========================
+# CONFIGURATION
+# =========================
 FILE_PATH = 'data/rag_database.txt'
 COLLECTION_NAME = "local_knowledge_collection"
-EMBEDDING_MODEL = 'nomic-embed-text'
-LANGUAGE_MODEL = 'hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest'
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LANGUAGE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 BATCH_SIZE = 512
 
-# --- Initialize Session State ---
+# =========================
+# LOAD ENV VARIABLES
+# =========================
+load_dotenv()  # reads from .env in same directory
+HF_API_KEY = os.getenv("HF_API_KEY")
+
+if not HF_API_KEY:
+    st.error("❌ Missing Hugging Face API key. Add `HF_API_KEY=your_key_here` in a `.env` file.")
+    st.stop()
+
+# Hugging Face inference client
+client = InferenceClient(model=LANGUAGE_MODEL, token=HF_API_KEY)
+
+# =========================
+# STREAMLIT STATE INIT
+# =========================
 if "collection" not in st.session_state:
     st.session_state.collection = None
 if "dataset_loaded" not in st.session_state:
     st.session_state.dataset_loaded = False
 
 
-# 🧠 Embedding Function Wrapper for Ollama
-class OllamaEmbeddingFunction(chromadb.api.types.EmbeddingFunction):
-    def __init__(self, model_name: str):
-        self.model_name = model_name
+# =========================
+# EMBEDDING FUNCTION
+# =========================
+class HuggingFaceEmbeddingFunction(chromadb.api.types.EmbeddingFunction):
+    def __init__(self, model_name: str = EMBEDDING_MODEL):
+        self.model = SentenceTransformer(model_name)
 
     def __call__(self, input_texts: chromadb.api.types.Documents) -> chromadb.api.types.Embeddings:
-        result = ollama.embed(model=self.model_name, input=input_texts)
-        return result['embeddings']
+        return self.model.encode(input_texts, convert_to_numpy=True).tolist()
 
 
-# 📂 Load Dataset
+# =========================
+# LOAD DATASET
+# =========================
 def load_data(file_path):
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     if not os.path.exists(file_path):
@@ -48,14 +70,16 @@ def load_data(file_path):
         return []
 
 
-# ⚙️ Setup ChromaDB
+# =========================
+# INITIALIZE CHROMADB
+# =========================
 def initialize_knowledge_base(dataset):
     with st.spinner("Loading ChromaDB collection..."):
         chroma_client = chromadb.PersistentClient(path="./chromadb_store")
-        ollama_embed_func_instance = OllamaEmbeddingFunction(model_name=EMBEDDING_MODEL)
+        hf_embed_func_instance = HuggingFaceEmbeddingFunction()
         collection = chroma_client.get_or_create_collection(
             name=COLLECTION_NAME,
-            embedding_function=ollama_embed_func_instance
+            embedding_function=hf_embed_func_instance
         )
 
         if collection.count() == 0:
@@ -75,12 +99,25 @@ def initialize_knowledge_base(dataset):
         return collection
 
 
-
-# 🔍 Retrieve Context
+# =========================
+# RETRIEVE CONTEXT
+# =========================
 def retrieve(collection, query: str, top_n: int = 3):
-    results = collection.query(query_texts=[query], n_results=top_n, include=['documents', 'distances'])
-    retrieved_knowledge = []
+    # Always reattach embedding function when querying
+    chroma_client = chromadb.PersistentClient(path="./chromadb_store")
+    hf_embed_func_instance = HuggingFaceEmbeddingFunction()
+    collection = chroma_client.get_collection(
+        name=COLLECTION_NAME,
+        embedding_function=hf_embed_func_instance
+    )
 
+    results = collection.query(
+        query_texts=[query],
+        n_results=top_n,
+        include=['documents', 'distances']
+    )
+
+    retrieved_knowledge = []
     if results and 'documents' in results and results['documents']:
         for chunk, distance in zip(results['documents'][0], results['distances'][0]):
             similarity = 1.0 - distance
@@ -88,7 +125,9 @@ def retrieve(collection, query: str, top_n: int = 3):
     return retrieved_knowledge
 
 
-# 💬 Generate Response
+# =========================
+# GENERATE RESPONSE
+# =========================
 def generate_response(input_query: str, joined_chunks: str):
     instruction_prompt = f"""SYSTEM:
 You are 'InterventionGPT', a certified road safety design engineer from the National Road Safety Hackathon 2025.
@@ -132,28 +171,28 @@ CONTEXT (retrieved documents):
 {joined_chunks}
 """
 
-
-
     messages = [
-        {'role': 'system', 'content': instruction_prompt},
-        {'role': 'user', 'content': input_query},
+        {"role": "system", "content": instruction_prompt},
+        {"role": "user", "content": input_query},
     ]
 
     response_text = ""
-    stream = ollama.chat(
-        model=LANGUAGE_MODEL,
-        messages=messages,
-        stream=True,
-        options={"temperature": 0.3}
-    )
-    for chunk in stream:
-        if chunk.get('message', {}).get('content'):
-            response_text += chunk['message']['content']
 
-    return response_text
+    try:
+        # Safer: non-streaming call first
+        response = client.chat_completion(messages=messages, max_tokens=1024, temperature=0.3)
+        if hasattr(response, "choices") and response.choices:
+            response_text = response.choices[0].message["content"]
+        else:
+            response_text = str(response)
+        yield response_text
 
+    except Exception as e:
+        yield f"[Error generating response: {e}]"
 
-# 🚀 Streamlit UI
+# =========================
+# STREAMLIT UI
+# =========================
 st.set_page_config(page_title="InterventionGPT - Road Safety", page_icon="🛣️", layout="wide")
 st.title("🧠 InterventionGPT - Road Safety Intervention Assistant")
 
@@ -165,16 +204,16 @@ if st.button("Load Knowledge Base"):
     dataset = load_data(FILE_PATH)
     if dataset:
         st.session_state.collection = initialize_knowledge_base(dataset)
-
         st.session_state.dataset_loaded = True
         st.success(f"Loaded {len(dataset)} records into ChromaDB!")
+
 
 if not st.session_state.dataset_loaded:
     st.warning("⚠️ Please load your dataset first.")
 else:
     query = st.text_area("Describe a road safety issue:", placeholder="e.g., Pedestrian crossings near a school lack visibility and signage.")
     top_n = st.slider("Number of retrieved context chunks:", 1, 5, 3)
-
+    st.write("Docs in collection:", st.session_state.collection.count())
     if st.button("Generate Intervention"):
         with st.spinner("Retrieving relevant context..."):
             retrieved = retrieve(st.session_state.collection, query, top_n=top_n)
@@ -188,11 +227,13 @@ else:
 
             joined_chunks = "\n".join([chunk for chunk, _ in retrieved])
 
-            with st.spinner("Generating response using Qwen 4B..."):
-                output = generate_response(query, joined_chunks)
-
             st.subheader("📄 InterventionGPT Output")
-            st.code(output, language="json")
+            response_container = st.empty()
+            full_response = ""
+            with st.spinner("Generating response using Hugging Face..."):
+                for piece in generate_response(query, joined_chunks):
+                    full_response += piece
+                    response_container.markdown(f"```\n{full_response}\n```")
 
 st.markdown("---")
-st.caption("Developed for NRSH 2025 Hackathon | Powered by Ollama + ChromaDB + Streamlit")
+st.caption("Developed for NRSH 2025 Hackathon | Powered by Hugging Face + ChromaDB + Streamlit")
