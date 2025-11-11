@@ -1,0 +1,4 @@
+/.venv
+/.vscode
+/chromadb_store
+/env
