@@ -1,3 +1,5 @@
-ollama
-chromadb
 streamlit
+chromadb
+sentence-transformers
+huggingface_hub
+python-dotenv
